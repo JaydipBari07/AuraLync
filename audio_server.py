@@ -167,7 +167,7 @@ def main():
             while not shutdown_event.is_set():
                 time.sleep(1)
                 if clients:
-                    print(f"Active clients: {len(clients)}", flush=True)
+                    print(f"\rActive clients: {len(clients)}", end="", flush=True)
     
     except KeyboardInterrupt:
         print("\n\nStopping server...")
