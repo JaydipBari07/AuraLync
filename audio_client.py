@@ -29,14 +29,21 @@ MAX_QUEUE_SIZE = 100
 # ============================================================================
 
 audio_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+playback_count = 0
 
 
 def audio_callback(outdata, frames, time_info, status):
+    global playback_count
     if status:
         print(f"Status: {status}")
     
     try:
-        outdata[:] = audio_queue.get_nowait()
+        data = audio_queue.get_nowait()
+        outdata[:] = data
+        playback_count += 1
+        if playback_count % 100 == 0:
+            max_amplitude = np.max(np.abs(data))
+            print(f"\rPlayback callback called {playback_count} times, Max amplitude: {max_amplitude:.4f}", end="", flush=True)
     except queue.Empty:
         outdata.fill(0)  # Silence if no data
 
@@ -86,7 +93,7 @@ def receive_config(sock):
 def receive_audio_thread(sock):
     print("\nStarting audio playback...")
     
-    packet_count = 0
+    frame_count = 0
     try:
         while True:
             # Get chunk size
@@ -114,13 +121,12 @@ def receive_audio_thread(sock):
             audio_array = np.frombuffer(audio_data, dtype=np.float32)
             audio_array = audio_array.reshape(-1, CHANNELS)
             
-            packet_count += 1
-            if packet_count % 100 == 0:  # Print every 100 packets
-                print(f"\rReceiving... packets: {packet_count}, queue size: {audio_queue.qsize()}", end='', flush=True)
-            
             # Add to playback queue
             try:
                 audio_queue.put_nowait(audio_array)
+                frame_count += 1
+                if frame_count % 100 == 0:
+                    print(f"\rReceived {frame_count} audio frames, Queue size: {audio_queue.qsize()}", end="", flush=True)
             except queue.Full:
                 pass  # Drop frame if queue full
     
@@ -130,13 +136,55 @@ def receive_audio_thread(sock):
 
 def list_output_devices():
     devices = sd.query_devices()
-    print("\nAvailable audio outputs:")
+    print("\nAvailable audio OUTPUT devices:")
+    output_devices = []
     for idx, device in enumerate(devices):
-        if device['max_output_channels'] > 0 and idx == sd.default.device[1]:
+        if device['max_output_channels'] > 0:
+            output_devices.append((idx, device))
             default = " (DEFAULT)" if idx == sd.default.device[1] else ""
-            print(f"  [{idx}] {device['name']} (DEFAULT)")
-            break
+            print(f"  [{idx}] {device['name']}{default}")
     print()
+    return output_devices
+
+
+def select_output_device():
+    output_devices = list_output_devices()
+    
+    if not output_devices:
+        print("ERROR: No output devices found!")
+        return None
+    
+    # Show default device suggestion
+    default_idx = sd.default.device[1]
+    if default_idx is not None:
+        default_device = sd.query_devices(default_idx)
+        print(f"Default device is: [{default_idx}] {default_device['name']}")
+        while True:
+            choice = input(f"Use default device? (y/n) or enter device number: ").strip().lower()
+            if choice == 'y' or choice == 'yes' or choice == '':
+                return default_idx
+            elif choice == 'n' or choice == 'no':
+                break
+            elif choice.isdigit():
+                selected = int(choice)
+                if any(selected == idx for idx, _ in output_devices):
+                    return selected
+                else:
+                    print(f"Invalid device number. Please choose from the list above.")
+            else:
+                print("Please enter 'y', 'n', or a device number.")
+    
+    # Manual selection
+    while True:
+        choice = input("\nEnter device number to use: ").strip()
+        if choice.isdigit():
+            selected = int(choice)
+            if any(selected == idx for idx, _ in output_devices):
+                return selected
+            else:
+                print(f"Invalid device number. Please choose from the list above.")
+        else:
+            print("Please enter a valid device number.")
 
 
 def main():
@@ -152,9 +200,13 @@ def main():
     server_ip = sys.argv[1]
     port = 5555
     
-    list_output_devices()
+    # Select output device
+    device_idx = select_output_device()
+    if device_idx is None:
+        print("ERROR: No output device selected.")
+        return
     
-    print(f"Connecting to {server_ip}:{port}...")
+    print(f"\nConnecting to {server_ip}:{port}...")
     
     try:
         # Connect to server
@@ -169,7 +221,9 @@ def main():
             return
         
         # Start audio output
+        print(f"Using output device: [{device_idx}]")
         with sd.OutputStream(
+            device=device_idx,
             channels=CHANNELS,
             samplerate=SAMPLE_RATE,
             blocksize=CHUNK_SIZE,
