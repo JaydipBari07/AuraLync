@@ -27,32 +27,73 @@ clients_lock = threading.Lock()
 audio_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
 
 shutdown_event = threading.Event()
+capture_count = 0
 
 
-def find_loopback_device():
+def list_input_devices():
     devices = sd.query_devices()
     
-    print("\nAvailable audio devices:")
+    print("\nAvailable audio INPUT devices:")
+    input_devices = []
     for idx, device in enumerate(devices):
         if device['max_input_channels'] > 0:
-            print(f"  [{idx}] {device['name']}")
+            input_devices.append((idx, device))
+            default_marker = " (DEFAULT)" if idx == sd.default.device[0] else ""
+            print(f"  [{idx}] {device['name']}{default_marker}")
     
-    # Search for loopback device
-    for idx, device in enumerate(devices):
+    return input_devices
+
+
+def select_input_device():
+    input_devices = list_input_devices()
+    
+    if not input_devices:
+        print("ERROR: No input devices found!")
+        return None
+    
+    # Try to auto-detect loopback device
+    for idx, device in input_devices:
         name_lower = device['name'].lower()
-        if name_lower.__contains__('stereo mix'):
-            print(f"\nFound loopback device: {device['name']}")
-            return idx
+        if 'stereo mix' in name_lower or 'wave out mix' in name_lower or 'loopback' in name_lower:
+            print(f"\nAuto-detected loopback device: [{idx}] {device['name']}")
+            while True:
+                choice = input(f"Use this device? (y/n) or enter device number: ").strip().lower()
+                if choice == 'y' or choice == 'yes':
+                    return idx
+                elif choice == 'n' or choice == 'no':
+                    break
+                elif choice.isdigit():
+                    selected = int(choice)
+                    if any(selected == idx for idx, _ in input_devices):
+                        return selected
+                    else:
+                        print(f"Invalid device number. Please choose from the list above.")
+                else:
+                    print("Please enter 'y', 'n', or a device number.")
     
-    print("WARNING: No loopback device found!")
-    return None
+    # Manual selection
+    while True:
+        choice = input("\nEnter device number to use: ").strip()
+        if choice.isdigit():
+            selected = int(choice)
+            if any(selected == idx for idx, _ in input_devices):
+                return selected
+            else:
+                print(f"Invalid device number. Please choose from the list above.")
+        else:
+            print("Please enter a valid device number.")
 
 
 def audio_callback(indata, frames, time_info, status):
+    global capture_count
     if status:
         print(f"Audio status: {status}")
     try:
         audio_queue.put_nowait(indata.copy())
+        capture_count += 1
+        if capture_count % 100 == 0:
+            max_amplitude = np.max(np.abs(indata))
+            print(f"\rCapturing audio... Frame {capture_count}, Max amplitude: {max_amplitude:.4f}", end="", flush=True)
     except queue.Full:
         pass  # Drop frame if queue is full
 
@@ -131,7 +172,9 @@ def main():
     # Get server IP
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
-    print(f"Clients should connect to: {local_ip}")
+    print(f"\nConnection Info:")
+    print(f"  - From THIS machine: 127.0.0.1 or localhost")
+    print(f"  - From OTHER machines: {local_ip}")
     
     # Setup server socket
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -145,14 +188,15 @@ def main():
     threading.Thread(target=accept_clients_thread, args=(server,), daemon=True).start()
     threading.Thread(target=broadcast_thread, daemon=True).start()
     
-    # Find audio device
-    device_idx = find_loopback_device()
+    # Select audio device
+    device_idx = select_input_device()
     if device_idx is None:
-        print("ERROR: No audio input device found.")
+        print("ERROR: No audio input device selected.")
         return
     
     # Start audio capture
-    print(f"\nCapturing audio from device {device_idx}...")
+    print(f"\nCapturing audio from device [{device_idx}]...")
+    print("Make sure audio is playing on the server machine!")
     try:
         with sd.InputStream(
             device=device_idx,
