@@ -2,9 +2,10 @@ import socket
 import sounddevice as sd
 import numpy as np
 import struct
+import sys
 
 # -------- CONFIG --------
-SERVER_IP = "192.168.29.88"   # Replace with your server PC's LAN IP
+SERVER_IP = sys.argv[1]   # Replace with your server PC's LAN IP
 PORT = 50007
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 1024
