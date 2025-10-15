@@ -6,6 +6,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 import threading
+from queue import Queue, Full
 
 # -------- CONFIG --------
 HOST = "0.0.0.0"   # Listen on all interfaces
@@ -23,14 +24,12 @@ class AudioServerGUI:
         self.root.minsize(500, 450)
         
         self.server_socket = None
-        self.client_connections = []  # List to track all connected clients
+        self.client_queues = {}  # Dictionary mapping client connections to their queues
         self.clients_lock = threading.Lock()  # Lock for thread-safe client list access
         self.is_streaming = False
         self.server_thread = None
         self.audio_thread = None
         self.mic = None
-        self.audio_buffer = None
-        self.buffer_lock = threading.Lock()
         
         # Configure style
         style = ttk.Style()
@@ -162,49 +161,46 @@ class AudioServerGUI:
         
     def handle_client(self, client_conn, addr):
         """Handle individual client connection in a separate thread."""
+        client_queue = Queue(maxsize=10)  # Buffer up to 10 audio packets per client
+        
         try:
             self.root.after(0, lambda a=addr: self.log_message(f"✅ Client connected from {a[0]}:{a[1]}"))
             
-            # Add client to the list
+            # Add client queue to the dictionary
             with self.clients_lock:
-                self.client_connections.append(client_conn)
-                num_clients = len(self.client_connections)
+                self.client_queues[client_conn] = client_queue
+                num_clients = len(self.client_queues)
             
             self.root.after(0, lambda n=num_clients: self.status_label.config(
                 text=f"🟢 Streaming to {n} client{'s' if n != 1 else ''}",
                 fg="#27ae60"))
             
-            # Keep connection alive and send audio data
+            # Keep connection alive and send audio data from this client's queue
             while self.is_streaming:
                 try:
-                    # Wait for new audio data
-                    with self.buffer_lock:
-                        if self.audio_buffer is not None:
-                            data_bytes = self.audio_buffer
-                        else:
-                            time.sleep(0.001)
-                            continue
+                    # Wait for audio data from the queue (blocking with timeout)
+                    data_bytes = client_queue.get(timeout=1.0)
                     
                     # Send audio data to this client
                     client_conn.sendall(struct.pack(">I", len(data_bytes)) + data_bytes)
                     
-                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                    break
                 except Exception as e:
-                    if self.is_streaming:
-                        self.root.after(0, lambda e=e, a=addr: self.log_message(
-                            f"⚠️ Error sending to {a[0]}:{a[1]}: {str(e)}"))
-                    break
+                    if isinstance(e, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+                        break
+                    # Queue.get timeout is normal, just continue
+                    if self.is_streaming and not isinstance(e, Exception) or str(e) != '':
+                        continue
                     
         except Exception as e:
-            self.root.after(0, lambda e=e, a=addr: self.log_message(
-                f"❌ Client handler error for {a[0]}:{a[1]}: {str(e)}"))
+            if self.is_streaming:
+                self.root.after(0, lambda e=e, a=addr: self.log_message(
+                    f"❌ Client handler error for {a[0]}:{a[1]}: {str(e)}"))
         finally:
-            # Remove client from list
+            # Remove client from dictionary
             with self.clients_lock:
-                if client_conn in self.client_connections:
-                    self.client_connections.remove(client_conn)
-                num_clients = len(self.client_connections)
+                if client_conn in self.client_queues:
+                    del self.client_queues[client_conn]
+                num_clients = len(self.client_queues)
             
             try:
                 client_conn.close()
@@ -223,7 +219,7 @@ class AudioServerGUI:
                     fg="#27ae60"))
     
     def capture_audio(self):
-        """Continuously capture audio and store it in buffer for broadcasting."""
+        """Continuously capture audio and broadcast to all connected clients."""
         try:
             default_speaker = sc.default_speaker()
             self.mic = sc.get_microphone(id=str(default_speaker.name), include_loopback=True)
@@ -234,9 +230,22 @@ class AudioServerGUI:
                         data = recorder.record(numframes=BLOCK_SIZE)
                         data_bytes = data.astype(np.float32).tobytes()
                         
-                        # Store audio data in buffer
-                        with self.buffer_lock:
-                            self.audio_buffer = data_bytes
+                        # Broadcast audio data to all connected clients
+                        with self.clients_lock:
+                            # Get a snapshot of current client queues
+                            queues_to_send = list(self.client_queues.items())
+                        
+                        # Send to each client's queue (outside the lock to avoid blocking)
+                        for client_conn, client_queue in queues_to_send:
+                            try:
+                                # Non-blocking put, drop packet if queue is full (client too slow)
+                                client_queue.put_nowait(data_bytes)
+                            except Full:
+                                # Queue full, client is lagging - skip this packet
+                                pass
+                            except Exception:
+                                # Client might have disconnected, ignore
+                                pass
                             
                     except Exception as e:
                         if self.is_streaming:
@@ -301,12 +310,12 @@ class AudioServerGUI:
         
         # Close all client connections
         with self.clients_lock:
-            for client_conn in self.client_connections[:]:  # Make a copy of the list
+            for client_conn in list(self.client_queues.keys()):  # Make a copy of the keys
                 try:
                     client_conn.close()
                 except:
                     pass
-            self.client_connections.clear()
+            self.client_queues.clear()
         
         if self.server_socket:
             try:

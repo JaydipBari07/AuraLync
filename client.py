@@ -6,6 +6,7 @@ import sys
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 import threading
+from queue import Queue, Empty
 
 # -------- CONFIG --------
 PORT = 50007
@@ -35,6 +36,7 @@ class AudioClientGUI:
         self.is_connected = False
         self.client_thread = None
         self.stream = None
+        self.audio_queue = Queue(maxsize=20)  # Buffer for smooth playback
         
         # Get available audio devices
         self.audio_devices = self.get_output_devices()
@@ -247,6 +249,49 @@ class AudioClientGUI:
                                               daemon=True)
         self.client_thread.start()
         
+    def audio_callback(self, outdata, frames, time_info, status):
+        """Audio callback function for smooth playback."""
+        try:
+            data = self.audio_queue.get_nowait()
+            frame = np.frombuffer(data, dtype=np.float32).reshape(-1, 2)
+            if len(frame) < frames:
+                # Pad with zeros if needed
+                outdata[:len(frame)] = frame
+                outdata[len(frame):] = 0
+            else:
+                outdata[:] = frame[:frames]
+        except Empty:
+            # No data available, output silence
+            outdata.fill(0)
+    
+    def receive_audio_data(self, server_ip, port):
+        """Separate thread to receive audio data and fill the queue."""
+        try:
+            while self.is_connected:
+                try:
+                    # Read packet length
+                    size_data = recvall(self.socket, 4)
+                    if not size_data:
+                        break
+                    block_size = struct.unpack(">I", size_data)[0]
+                    
+                    # Read audio data
+                    audio_data = recvall(self.socket, block_size)
+                    if not audio_data:
+                        break
+                    
+                    # Put data in queue (blocking until space available)
+                    self.audio_queue.put(audio_data, timeout=1.0)
+                    
+                except Exception as e:
+                    if self.is_connected:
+                        self.root.after(0, lambda e=e: self.log_message(f"⚠️ Receive error: {str(e)}"))
+                    break
+                    
+        except Exception as e:
+            if self.is_connected:
+                self.root.after(0, lambda e=e: self.log_message(f"❌ Receiver error: {str(e)}"))
+    
     def run_client(self, server_ip, port):
         try:
             self.root.after(0, lambda: self.log_message(f"🔌 Connecting to {server_ip}:{port}..."))
@@ -266,30 +311,29 @@ class AudioClientGUI:
             self.root.after(0, lambda: self.info_label.config(
                 text=f"Streaming from {server_ip}:{port}"))
             
-            # Start audio output stream
+            # Clear the queue
+            while not self.audio_queue.empty():
+                try:
+                    self.audio_queue.get_nowait()
+                except Empty:
+                    break
+            
+            # Start receiver thread
+            receiver_thread = threading.Thread(
+                target=self.receive_audio_data, 
+                args=(server_ip, port), 
+                daemon=True
+            )
+            receiver_thread.start()
+            
+            # Start audio output stream with callback
             with sd.OutputStream(samplerate=SAMPLE_RATE, channels=2, 
                                dtype='float32', blocksize=BLOCK_SIZE,
+                               callback=self.audio_callback,
                                device=self.selected_device) as self.stream:
+                # Wait until disconnected
                 while self.is_connected:
-                    try:
-                        # Read packet length
-                        size_data = recvall(self.socket, 4)
-                        if not size_data:
-                            break
-                        block_size = struct.unpack(">I", size_data)[0]
-                        
-                        # Read audio data
-                        audio_data = recvall(self.socket, block_size)
-                        if not audio_data:
-                            break
-                        
-                        frame = np.frombuffer(audio_data, dtype=np.float32).reshape(-1, 2)
-                        self.stream.write(frame)
-                        
-                    except Exception as e:
-                        if self.is_connected:
-                            self.root.after(0, lambda e=e: self.log_message(f"⚠️ Stream error: {str(e)}"))
-                        break
+                    sd.sleep(100)  # Sleep in 100ms intervals
             
             if self.is_connected:
                 self.root.after(0, lambda: self.log_message("⚠️ Connection lost"))
@@ -317,6 +361,13 @@ class AudioClientGUI:
                 self.socket.close()
             except:
                 pass
+        
+        # Clear the audio queue
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except Empty:
+                break
     
     def cleanup_after_disconnect(self):
         self.status_label.config(text="⚫ Disconnected", fg="#e74c3c")
