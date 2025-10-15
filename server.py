@@ -18,8 +18,9 @@ class AudioServerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("AuraLync - Audio Server")
-        self.root.geometry("500x400")
-        self.root.resizable(False, False)
+        self.root.geometry("550x550")
+        self.root.resizable(True, True)
+        self.root.minsize(500, 450)
         
         self.server_socket = None
         self.client_conn = None
@@ -114,11 +115,12 @@ class AudioServerGUI:
         log_frame.pack(fill=tk.BOTH, expand=True)
         
         self.log_text = scrolledtext.ScrolledText(log_frame, 
-                                                  height=6,
+                                                  height=10,
                                                   font=("Consolas", 9),
                                                   bg="#ffffff",
                                                   fg="#2c3e50",
-                                                  state=tk.DISABLED)
+                                                  state=tk.DISABLED,
+                                                  wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)

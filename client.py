@@ -27,8 +27,9 @@ class AudioClientGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("AuraLync - Audio Client")
-        self.root.geometry("500x450")
-        self.root.resizable(False, False)
+        self.root.geometry("550x600")
+        self.root.resizable(True, True)
+        self.root.minsize(500, 500)
         
         self.socket = None
         self.is_connected = False
@@ -132,11 +133,12 @@ class AudioClientGUI:
         log_frame.pack(fill=tk.BOTH, expand=True)
         
         self.log_text = scrolledtext.ScrolledText(log_frame, 
-                                                  height=8,
+                                                  height=12,
                                                   font=("Consolas", 9),
                                                   bg="#ffffff",
                                                   fg="#2c3e50",
-                                                  state=tk.DISABLED)
+                                                  state=tk.DISABLED,
+                                                  wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
