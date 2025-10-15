@@ -28,15 +28,16 @@ class AudioClientGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("AuraLync - Audio Client")
-        self.root.geometry("550x600")
+        self.root.geometry("550x700")
         self.root.resizable(True, True)
-        self.root.minsize(500, 500)
+        self.root.minsize(500, 600)
         
         self.socket = None
         self.is_connected = False
         self.client_thread = None
         self.stream = None
         self.audio_queue = Queue(maxsize=20)  # Buffer for smooth playback
+        self.volume_gain = 3.0  # Default volume boost (3x amplification)
         
         # Get available audio devices
         self.audio_devices = self.get_output_devices()
@@ -116,6 +117,38 @@ class AudioClientGUI:
                                cursor="hand2")
         refresh_btn.pack(side=tk.LEFT, padx=(5, 0))
         
+        # Volume control
+        volume_frame = tk.LabelFrame(content_frame, text="Volume Boost", 
+                                    font=("Arial", 10, "bold"),
+                                    bg="#ecf0f1", padx=10, pady=10)
+        volume_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        vol_control_frame = tk.Frame(volume_frame, bg="#ecf0f1")
+        vol_control_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(vol_control_frame, text="1x", font=("Arial", 9), 
+                bg="#ecf0f1", width=4).pack(side=tk.LEFT)
+        
+        self.volume_slider = tk.Scale(vol_control_frame, 
+                                      from_=1.0, to=10.0, 
+                                      resolution=0.5,
+                                      orient=tk.HORIZONTAL,
+                                      command=self.update_volume,
+                                      font=("Arial", 9),
+                                      bg="#ecf0f1",
+                                      highlightthickness=0,
+                                      length=300)
+        self.volume_slider.set(3.0)  # Default 3x boost
+        self.volume_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        tk.Label(vol_control_frame, text="10x", font=("Arial", 9), 
+                bg="#ecf0f1", width=4).pack(side=tk.LEFT)
+        
+        self.volume_label = tk.Label(volume_frame, text="Current: 3.0x", 
+                                     font=("Arial", 9, "bold"), 
+                                     bg="#ecf0f1", fg="#2c3e50")
+        self.volume_label.pack(pady=(0, 5))
+        
         # Status display
         status_frame = tk.LabelFrame(content_frame, text="Status", 
                                     font=("Arial", 10, "bold"),
@@ -181,6 +214,11 @@ class AudioClientGUI:
         self.log_text.insert(tk.END, f"{message}\n")
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
+    
+    def update_volume(self, value):
+        """Update volume gain from slider."""
+        self.volume_gain = float(value)
+        self.volume_label.config(text=f"Current: {self.volume_gain:.1f}x")
     
     def get_output_devices(self):
         """Get list of available output audio devices."""
@@ -254,6 +292,13 @@ class AudioClientGUI:
         try:
             data = self.audio_queue.get_nowait()
             frame = np.frombuffer(data, dtype=np.float32).reshape(-1, 2)
+            
+            # Apply volume gain
+            frame = frame * self.volume_gain
+            
+            # Clip to prevent distortion
+            frame = np.clip(frame, -1.0, 1.0)
+            
             if len(frame) < frames:
                 # Pad with zeros if needed
                 outdata[:len(frame)] = frame
