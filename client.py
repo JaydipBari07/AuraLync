@@ -36,6 +36,10 @@ class AudioClientGUI:
         self.client_thread = None
         self.stream = None
         
+        # Get available audio devices
+        self.audio_devices = self.get_output_devices()
+        self.selected_device = None
+        
         # Configure style
         style = ttk.Style()
         style.theme_use('clam')
@@ -82,6 +86,33 @@ class AudioClientGUI:
         self.port_entry = tk.Entry(port_frame, font=("Arial", 10), width=20)
         self.port_entry.insert(0, str(PORT))
         self.port_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Audio device selection
+        device_frame = tk.Frame(config_frame, bg="#ecf0f1")
+        device_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(device_frame, text="Output Device:", font=("Arial", 10), 
+                bg="#ecf0f1", width=12, anchor='w').pack(side=tk.LEFT)
+        
+        device_names = [dev['name'] for dev in self.audio_devices]
+        self.device_combo = ttk.Combobox(device_frame, 
+                                         values=device_names,
+                                         font=("Arial", 9),
+                                         state="readonly",
+                                         width=35)
+        if device_names:
+            self.device_combo.current(0)  # Select first device by default
+        self.device_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        # Refresh button for devices
+        refresh_btn = tk.Button(device_frame, text="🔄", 
+                               command=self.refresh_devices,
+                               font=("Arial", 10),
+                               bg="#95a5a6", fg="white",
+                               relief=tk.FLAT,
+                               padx=8, pady=2,
+                               cursor="hand2")
+        refresh_btn.pack(side=tk.LEFT, padx=(5, 0))
         
         # Status display
         status_frame = tk.LabelFrame(content_frame, text="Status", 
@@ -148,6 +179,38 @@ class AudioClientGUI:
         self.log_text.insert(tk.END, f"{message}\n")
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
+    
+    def get_output_devices(self):
+        """Get list of available output audio devices."""
+        devices = []
+        try:
+            device_list = sd.query_devices()
+            for i, device in enumerate(device_list):
+                if device['max_output_channels'] > 0:  # Output device
+                    devices.append({
+                        'index': i,
+                        'name': device['name'],
+                        'channels': device['max_output_channels']
+                    })
+            if not devices:
+                devices.append({'index': None, 'name': 'Default Device', 'channels': 2})
+        except Exception as e:
+            self.log_message(f"⚠️ Error querying devices: {str(e)}")
+            devices.append({'index': None, 'name': 'Default Device', 'channels': 2})
+        return devices
+    
+    def refresh_devices(self):
+        """Refresh the list of audio devices."""
+        if self.is_connected:
+            self.log_message("⚠️ Cannot refresh devices while connected")
+            return
+        
+        self.audio_devices = self.get_output_devices()
+        device_names = [dev['name'] for dev in self.audio_devices]
+        self.device_combo['values'] = device_names
+        if device_names:
+            self.device_combo.current(0)
+        self.log_message("🔄 Audio devices refreshed")
         
     def connect_to_server(self):
         server_ip = self.ip_entry.get().strip()
@@ -162,8 +225,19 @@ class AudioClientGUI:
             self.log_message("❌ Please enter server IP address")
             return
         
+        # Get selected audio device
+        selected_idx = self.device_combo.current()
+        if selected_idx >= 0 and selected_idx < len(self.audio_devices):
+            self.selected_device = self.audio_devices[selected_idx]['index']
+            device_name = self.audio_devices[selected_idx]['name']
+            self.log_message(f"🔊 Using output device: {device_name}")
+        else:
+            self.selected_device = None
+            self.log_message("🔊 Using default output device")
+        
         self.ip_entry.config(state=tk.DISABLED)
         self.port_entry.config(state=tk.DISABLED)
+        self.device_combo.config(state=tk.DISABLED)
         self.connect_button.config(state=tk.DISABLED)
         self.disconnect_button.config(state=tk.NORMAL)
         
@@ -194,7 +268,8 @@ class AudioClientGUI:
             
             # Start audio output stream
             with sd.OutputStream(samplerate=SAMPLE_RATE, channels=2, 
-                               dtype='float32', blocksize=BLOCK_SIZE) as self.stream:
+                               dtype='float32', blocksize=BLOCK_SIZE,
+                               device=self.selected_device) as self.stream:
                 while self.is_connected:
                     try:
                         # Read packet length
@@ -250,6 +325,7 @@ class AudioClientGUI:
         self.disconnect_button.config(state=tk.DISABLED)
         self.ip_entry.config(state=tk.NORMAL)
         self.port_entry.config(state=tk.NORMAL)
+        self.device_combo.config(state="readonly")
         
     def on_closing(self):
         if self.is_connected:
