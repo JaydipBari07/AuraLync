@@ -1,139 +1,638 @@
+#!/usr/bin/env python3
+"""
+AuraLync Server - Stream audio from PC to phone via web browser
+Uses binary WebSocket for low-latency audio streaming
+"""
+
+import asyncio
 import socket
 import soundcard as sc
 import numpy as np
-import struct
-import time
-import tkinter as tk
-from tkinter import ttk, scrolledtext
 import threading
 from queue import Queue, Full
+from aiohttp import web
+import socketio
+import qrcode
+import io
+import warnings
 
-# -------- CONFIG --------
-HOST = "0.0.0.0"   # Listen on all interfaces
-PORT = 50007
+warnings.filterwarnings('ignore', category=sc.SoundcardRuntimeWarning)
+
+# Configuration
+HOST = "0.0.0.0"
+HTTP_PORT = 8080
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 1024
-# ------------------------
+CHANNELS = 2
 
-class AudioServerGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("AuraLync - Audio Server")
-        self.root.geometry("550x550")
-        self.root.resizable(True, True)
-        self.root.minsize(500, 450)
+class OptimizedAudioServer:
+    def __init__(self):
+        self.sio = socketio.AsyncServer(
+            async_mode='aiohttp',
+            cors_allowed_origins='*',
+            ping_timeout=60,
+            ping_interval=25,
+            max_http_buffer_size=1000000
+        )
+        self.app = web.Application()
+        self.sio.attach(self.app)
         
-        self.server_socket = None
-        self.client_queues = {}  # Dictionary mapping client connections to their queues
-        self.clients_lock = threading.Lock()  # Lock for thread-safe client list access
+        self.clients = {}
+        self.clients_lock = threading.Lock()
         self.is_streaming = False
-        self.server_thread = None
         self.audio_thread = None
         self.mic = None
         
-        # Configure style
-        style = ttk.Style()
-        style.theme_use('clam')
+        self.setup_routes()
+        self.setup_socketio()
         
-        self.setup_ui()
+    def setup_routes(self):
+        self.app.router.add_get('/', self.index_handler)
+        self.app.router.add_get('/qr', self.qr_handler)
         
-    def setup_ui(self):
-        # Header Frame
-        header_frame = tk.Frame(self.root, bg="#2c3e50", height=60)
-        header_frame.pack(fill=tk.X)
-        header_frame.pack_propagate(False)
+    def setup_socketio(self):
+        @self.sio.event
+        async def connect(sid, environ):
+            print(f'Client connected: {sid}')
+            with self.clients_lock:
+                self.clients[sid] = {'connected': True}
+            await self.sio.emit('connection_status', {
+                'status': 'connected',
+                'sample_rate': SAMPLE_RATE,
+                'block_size': BLOCK_SIZE,
+                'channels': CHANNELS
+            }, room=sid)
+            
+        @self.sio.event
+        async def disconnect(sid):
+            print(f'Client disconnected: {sid}')
+            with self.clients_lock:
+                if sid in self.clients:
+                    del self.clients[sid]
+                    
+        @self.sio.event
+        async def request_stream(sid, data):
+            print(f'Stream requested by: {sid}')
+            await self.sio.emit('stream_started', {}, room=sid)
+    
+    async def index_handler(self, request):
+        html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AuraLync - Audio Streaming</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         
-        title_label = tk.Label(header_frame, text="🎧 Audio Server", 
-                              font=("Arial", 18, "bold"), 
-                              bg="#2c3e50", fg="white")
-        title_label.pack(pady=15)
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            color: white;
+            padding: 20px;
+        }
         
-        # Main content frame
-        content_frame = tk.Frame(self.root, bg="#ecf0f1", padx=20, pady=20)
-        content_frame.pack(fill=tk.BOTH, expand=True)
+        .container { max-width: 600px; margin: 0 auto; width: 100%; }
         
-        # Server configuration
-        config_frame = tk.LabelFrame(content_frame, text="Server Configuration", 
-                                    font=("Arial", 10, "bold"),
-                                    bg="#ecf0f1", padx=10, pady=10)
-        config_frame.pack(fill=tk.X, pady=(0, 10))
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
         
-        # Port configuration
-        port_frame = tk.Frame(config_frame, bg="#ecf0f1")
-        port_frame.pack(fill=tk.X, pady=5)
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }
         
-        tk.Label(port_frame, text="Port:", font=("Arial", 10), 
-                bg="#ecf0f1", width=10, anchor='w').pack(side=tk.LEFT)
-        self.port_entry = tk.Entry(port_frame, font=("Arial", 10), width=15)
-        self.port_entry.insert(0, str(PORT))
-        self.port_entry.pack(side=tk.LEFT, padx=5)
+        .badge {
+            display: inline-block;
+            background: rgba(255,255,255,0.2);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+        }
         
-        # Status display
-        status_frame = tk.LabelFrame(content_frame, text="Status", 
-                                    font=("Arial", 10, "bold"),
-                                    bg="#ecf0f1", padx=10, pady=10)
-        status_frame.pack(fill=tk.X, pady=(0, 10))
+        .card {
+            background: rgba(255, 255, 255, 0.15);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        }
         
-        self.status_label = tk.Label(status_frame, text="⚫ Stopped", 
-                                     font=("Arial", 12, "bold"), 
-                                     bg="#ecf0f1", fg="#e74c3c")
-        self.status_label.pack(pady=5)
+        .qr-container {
+            text-align: center;
+            padding: 20px;
+        }
         
-        self.info_label = tk.Label(status_frame, text="Click 'Start Server' to begin", 
-                                   font=("Arial", 9), 
-                                   bg="#ecf0f1", fg="#7f8c8d")
-        self.info_label.pack()
+        .qr-container img {
+            max-width: 200px;
+            background: white;
+            padding: 10px;
+            border-radius: 10px;
+        }
         
-        # Control buttons
-        button_frame = tk.Frame(content_frame, bg="#ecf0f1")
-        button_frame.pack(pady=10)
+        .status {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 20px;
+        }
         
-        self.start_button = tk.Button(button_frame, text="▶ Start Server", 
-                                      command=self.start_server,
-                                      font=("Arial", 11, "bold"),
-                                      bg="#27ae60", fg="white",
-                                      activebackground="#229954",
-                                      activeforeground="white",
-                                      relief=tk.FLAT,
-                                      padx=20, pady=10,
-                                      cursor="hand2")
-        self.start_button.pack(side=tk.LEFT, padx=5)
+        .status-dot {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            margin-right: 10px;
+            animation: pulse 2s infinite;
+        }
         
-        self.stop_button = tk.Button(button_frame, text="⬛ Stop Server", 
-                                     command=self.stop_server,
-                                     font=("Arial", 11, "bold"),
-                                     bg="#e74c3c", fg="white",
-                                     activebackground="#c0392b",
-                                     activeforeground="white",
-                                     relief=tk.FLAT,
-                                     padx=20, pady=10,
-                                     state=tk.DISABLED,
-                                     cursor="hand2")
-        self.stop_button.pack(side=tk.LEFT, padx=5)
+        .status-dot.disconnected { background: #e74c3c; }
+        .status-dot.connected { background: #2ecc71; }
+        .status-dot.playing { background: #3498db; }
         
-        # Log display
-        log_frame = tk.LabelFrame(content_frame, text="Log", 
-                                 font=("Arial", 10, "bold"),
-                                 bg="#ecf0f1", padx=5, pady=5)
-        log_frame.pack(fill=tk.BOTH, expand=True)
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
         
-        self.log_text = scrolledtext.ScrolledText(log_frame, 
-                                                  height=10,
-                                                  font=("Consolas", 9),
-                                                  bg="#ffffff",
-                                                  fg="#2c3e50",
-                                                  state=tk.DISABLED,
-                                                  wrap=tk.WORD)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        .btn {
+            width: 100%;
+            padding: 18px;
+            font-size: 1.2rem;
+            font-weight: 600;
+            border: none;
+            border-radius: 15px;
+            cursor: pointer;
+            margin-top: 10px;
+            color: white;
+            transition: transform 0.2s;
+        }
         
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        .btn:active { transform: scale(0.98); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         
-    def log_message(self, message):
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, f"{message}\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state=tk.DISABLED)
+        .btn-connect { background: linear-gradient(135deg, #2ecc71 0%, #27ae60 100%); }
+        .btn-play { background: linear-gradient(135deg, #3498db 0%, #2980b9 100%); }
+        .btn-stop { background: linear-gradient(135deg, #95a5a6 0%, #7f8c8d 100%); }
+        .btn-disconnect { background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); }
         
+        .volume-control {
+            margin-top: 20px;
+        }
+        
+        .volume-label {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+        
+        .volume-value {
+            font-weight: 700;
+        }
+        
+        input[type="range"] {
+            width: 100%;
+            height: 8px;
+            border-radius: 5px;
+            background: rgba(255, 255, 255, 0.3);
+            outline: none;
+            -webkit-appearance: none;
+        }
+        
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: white;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+        }
+        
+        .stats {
+            display: flex;
+            justify-content: center;
+            margin-top: 20px;
+        }
+        
+        .stat-item {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 20px 40px;
+            border-radius: 10px;
+            text-align: center;
+            min-width: 200px;
+        }
+        
+        .stat-label {
+            font-size: 0.85rem;
+            opacity: 0.8;
+            margin-bottom: 5px;
+        }
+        
+        .stat-value {
+            font-size: 1.3rem;
+            font-weight: 700;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>AuraLync</h1>
+            <div class="badge" id="bufferStatusBadge">Audio Streaming</div>
+        </div>
+        
+        <div class="card qr-container">
+            <div style="font-weight: 600; margin-bottom: 15px;">Scan to Connect</div>
+            <img src="/qr" alt="QR Code">
+        </div>
+        
+        <div class="card">
+            <div class="status">
+                <div class="status-dot disconnected" id="statusDot"></div>
+                <span id="statusText">Disconnected</span>
+            </div>
+            
+            <button class="btn btn-connect" id="connectBtn" onclick="connect()">
+                Connect
+            </button>
+            
+            <button class="btn btn-play" id="playBtn" onclick="startPlayback()" disabled style="display:none;">
+                Start Playback
+            </button>
+            
+            <button class="btn btn-stop" id="stopBtn" onclick="stopPlayback()" disabled style="display:none;">
+                Stop
+            </button>
+            
+            <button class="btn btn-disconnect" id="disconnectBtn" onclick="disconnect()" disabled style="display:none;">
+                Disconnect
+            </button>
+        </div>
+        
+        <div class="card volume-control">
+            <div class="volume-label">
+                <span>Volume</span>
+                <span class="volume-value" id="volumeValue">100%</span>
+            </div>
+            <input type="range" id="volumeSlider" min="0" max="200" value="100" oninput="updateVolume(this.value)">
+        </div>
+        
+        <div class="card stats">
+            <div class="stat-item">
+                <div class="stat-label">Buffer</div>
+                <div class="stat-value" id="bufferValue">--</div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let socket;
+        let audioContext;
+        let gainNode;
+        let isConnected = false;
+        let isPlaying = false;
+        let sampleRate = 44100;
+        let blockSize = 1024;
+        let channels = 2;
+        let scheduledTime = 0;
+        let bufferSize = 0;
+        
+        // Buffer management - prevents audio delay from growing too large
+        const TARGET_BUFFER = 0.15;    // target 150ms
+        const MAX_BUFFER = 0.50;       // reset if exceeds 500ms
+        const MIN_BUFFER = 0.05;       // minimum 50ms
+        
+        function updateStatus(status, text) {
+            document.getElementById('statusDot').className = 'status-dot ' + status;
+            document.getElementById('statusText').textContent = text;
+        }
+        
+        function connect() {
+            updateStatus('connected', 'Connecting...');
+            
+            socket = io({
+                transports: ['websocket'],
+                upgrade: false
+            });
+            
+            socket.on('connect', () => {
+                console.log('Connected to server');
+                isConnected = true;
+                updateStatus('connected', 'Connected');
+                
+                document.getElementById('connectBtn').style.display = 'none';
+                document.getElementById('playBtn').style.display = 'block';
+                document.getElementById('playBtn').disabled = false;
+                document.getElementById('disconnectBtn').style.display = 'block';
+                document.getElementById('disconnectBtn').disabled = false;
+            });
+            
+            socket.on('connection_status', (data) => {
+                sampleRate = data.sample_rate;
+                blockSize = data.block_size;
+                channels = data.channels;
+            });
+            
+            socket.on('audio_data', (arrayBuffer) => {
+                if (isPlaying) {
+                    receiveAudioData(arrayBuffer);
+                }
+            });
+            
+            socket.on('disconnect', () => {
+                handleDisconnection();
+            });
+        }
+        
+        async function startPlayback() {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: sampleRate,
+                    latencyHint: 'interactive'
+                });
+                
+                gainNode = audioContext.createGain();
+                gainNode.connect(audioContext.destination);
+                gainNode.gain.value = document.getElementById('volumeSlider').value / 100;
+                
+                scheduledTime = audioContext.currentTime;
+                
+                isPlaying = true;
+                updateStatus('playing', 'Playing');
+                
+                document.getElementById('playBtn').style.display = 'none';
+                document.getElementById('stopBtn').style.display = 'block';
+                document.getElementById('stopBtn').disabled = false;
+                
+                socket.emit('request_stream', {});
+                
+                monitorStats();
+                
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Error starting playback: ' + error.message);
+            }
+        }
+        
+        function stopPlayback() {
+            isPlaying = false;
+            
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            
+            updateStatus('connected', 'Connected');
+            
+            document.getElementById('stopBtn').style.display = 'none';
+            document.getElementById('playBtn').style.display = 'block';
+            document.getElementById('playBtn').disabled = false;
+            
+            document.getElementById('bufferStatusBadge').textContent = 'Audio Streaming';
+            document.getElementById('bufferStatusBadge').style.background = 'rgba(255,255,255,0.2)';
+        }
+        
+        function disconnect() {
+            if (isPlaying) {
+                stopPlayback();
+            }
+            
+            if (socket) {
+                socket.disconnect();
+            }
+            
+            handleDisconnection();
+        }
+        
+        function handleDisconnection() {
+            isConnected = false;
+            isPlaying = false;
+            
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            
+            updateStatus('disconnected', 'Disconnected');
+            
+            document.getElementById('connectBtn').style.display = 'block';
+            document.getElementById('playBtn').style.display = 'none';
+            document.getElementById('stopBtn').style.display = 'none';
+            document.getElementById('disconnectBtn').style.display = 'none';
+            
+            document.getElementById('bufferValue').textContent = '--';
+            
+            document.getElementById('bufferStatusBadge').textContent = 'Audio Streaming';
+            document.getElementById('bufferStatusBadge').style.background = 'rgba(255,255,255,0.2)';
+        }
+        
+        function receiveAudioData(arrayBuffer) {
+            try {
+                const audioData = new Float32Array(arrayBuffer);
+                scheduleAudio(audioData);
+            } catch (error) {
+                console.error('Error processing audio:', error);
+            }
+        }
+        
+        function scheduleAudio(audioData) {
+            if (!audioContext || !isPlaying) return;
+            
+            const currentTime = audioContext.currentTime;
+            bufferSize = Math.max(0, scheduledTime - currentTime);
+            
+            // Reset if buffer gets too large (fixes pause/resume latency issue)
+            if (bufferSize > MAX_BUFFER) {
+                console.log(`Buffer overflow: ${bufferSize.toFixed(2)}s, resetting to ${TARGET_BUFFER}s`);
+                scheduledTime = currentTime + TARGET_BUFFER;
+                bufferSize = TARGET_BUFFER;
+            }
+            
+            // Drop chunks if buffer is still high to let it drain
+            if (bufferSize > TARGET_BUFFER * 1.5) {
+                return;
+            }
+            
+            if (scheduledTime < currentTime) {
+                scheduledTime = currentTime + TARGET_BUFFER;
+            }
+            
+            // Convert audio data to proper format
+            const numFrames = audioData.length / channels;
+            const audioBuffer = audioContext.createBuffer(channels, numFrames, sampleRate);
+            
+            for (let channel = 0; channel < channels; channel++) {
+                const channelData = audioBuffer.getChannelData(channel);
+                for (let i = 0; i < numFrames; i++) {
+                    channelData[i] = audioData[i * channels + channel];
+                }
+            }
+            
+            // Schedule for playback
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(gainNode);
+            
+            source.start(scheduledTime);
+            scheduledTime += audioBuffer.duration;
+            bufferSize = Math.max(0, scheduledTime - currentTime);
+        }
+        
+        function updateVolume(value) {
+            document.getElementById('volumeValue').textContent = value + '%';
+            if (gainNode) {
+                gainNode.gain.value = value / 100;
+            }
+        }
+        
+        function monitorStats() {
+            if (!isPlaying) return;
+            
+            document.getElementById('bufferValue').textContent = bufferSize.toFixed(2) + 's';
+            
+            // Update buffer health indicator
+            const badge = document.getElementById('bufferStatusBadge');
+            if (bufferSize < MIN_BUFFER) {
+                badge.textContent = 'Buffer Low';
+                badge.style.background = 'rgba(231, 76, 60, 0.3)';
+            } else if (bufferSize > MAX_BUFFER * 0.8) {
+                badge.textContent = 'Buffer High';
+                badge.style.background = 'rgba(230, 126, 34, 0.3)';
+            } else {
+                badge.textContent = 'Buffer OK';
+                badge.style.background = 'rgba(46, 204, 113, 0.3)';
+            }
+            
+            setTimeout(monitorStats, 100);
+        }
+    </script>
+</body>
+</html>
+        """
+        return web.Response(text=html, content_type='text/html')
+    
+    async def qr_handler(self, request):
+        local_ip = self.get_local_ip()
+        url = f"http://{local_ip}:{HTTP_PORT}"
+        
+        qr = qrcode.QRCode(version=1, box_size=10, border=4)
+        qr.add_data(url)
+        qr.make(fit=True)
+        
+        img = qr.make_image(fill_color="black", back_color="white")
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        
+        return web.Response(body=img_byte_arr.read(), content_type='image/png')
+    
+    def capture_audio(self):
+        # Capture system audio and send to connected clients
+        try:
+            print("Initializing audio capture...")
+            default_speaker = sc.default_speaker()
+            print(f"Using speaker: {default_speaker.name}")
+            
+            # Use loopback to capture system audio
+            self.mic = sc.get_microphone(id=str(default_speaker.name), include_loopback=True)
+            print(f"Microphone ready: {self.mic.name}")
+            
+            with self.mic.recorder(samplerate=SAMPLE_RATE) as recorder:
+                while self.is_streaming:
+                    try:
+                        data = recorder.record(numframes=BLOCK_SIZE)
+                        data_float32 = np.ascontiguousarray(data, dtype=np.float32)
+                        data_bytes = data_float32.tobytes()
+                        
+                        with self.clients_lock:
+                            client_sids = list(self.clients.keys())
+                        
+                        # Send audio to all connected clients
+                        for sid in client_sids:
+                            try:
+                                asyncio.run_coroutine_threadsafe(
+                                    self.sio.emit('audio_data', data_bytes, room=sid),
+                                    self.loop
+                                )
+                            except Exception:
+                                pass
+                                
+                    except Exception as e:
+                        if self.is_streaming:
+                            print(f"Audio capture error: {e}")
+                        self.is_streaming = False
+                        break
+                        
+        except Exception as e:
+            print(f"Audio initialization error: {e}")
+            print("\nNote: Enable 'Stereo Mix' in Windows sound settings if not working\n")
+            self.is_streaming = False
+    
+    def start_streaming(self):
+        if not self.is_streaming:
+            self.is_streaming = True
+            try:
+                self.audio_thread = threading.Thread(target=self.capture_audio, daemon=True)
+                self.audio_thread.start()
+                print("Audio streaming started")
+            except Exception as e:
+                print(f"Failed to start audio: {e}")
+                self.is_streaming = False
+    
+    async def start_server(self):
+        print("Starting AuraLync Server...", flush=True)
+        
+        runner = web.AppRunner(self.app)
+        await runner.setup()
+        
+        site = web.TCPSite(runner, HOST, HTTP_PORT)
+        await site.start()
+        
+        local_ip = self.get_local_ip()
+        server_url = f"http://{local_ip}:{HTTP_PORT}"
+        
+        print(f"""
+========================================
+AuraLync Server Running
+========================================
+URL: {server_url}
+
+Open this URL on your phone browser
+or scan the QR code below:
+        """, flush=True)
+        
+        self.print_qr_code(server_url)
+        
+        self.start_streaming()
+        
+        self.loop = asyncio.get_event_loop()
+        
+        try:
+            await asyncio.Event().wait()
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+            self.is_streaming = False
+    
+    def print_qr_code(self, url):
+        try:
+            qr = qrcode.QRCode(version=1, box_size=1, border=2)
+            qr.add_data(url)
+            qr.make(fit=True)
+            qr.print_ascii(invert=True)
+            print()
+        except Exception as e:
+            print(f"QR code error: {e}", flush=True)
+    
     def get_local_ip(self):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -143,203 +642,12 @@ class AudioServerGUI:
             return ip
         except:
             return "127.0.0.1"
-    
-    def start_server(self):
-        try:
-            port = int(self.port_entry.get())
-        except ValueError:
-            self.log_message("❌ Invalid port number")
-            return
-        
-        self.port_entry.config(state=tk.DISABLED)
-        self.start_button.config(state=tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL)
-        
-        self.is_streaming = True
-        self.server_thread = threading.Thread(target=self.run_server, args=(port,), daemon=True)
-        self.server_thread.start()
-        
-    def handle_client(self, client_conn, addr):
-        """Handle individual client connection in a separate thread."""
-        client_queue = Queue(maxsize=10)  # Buffer up to 10 audio packets per client
-        
-        try:
-            self.root.after(0, lambda a=addr: self.log_message(f"✅ Client connected from {a[0]}:{a[1]}"))
-            
-            # Add client queue to the dictionary
-            with self.clients_lock:
-                self.client_queues[client_conn] = client_queue
-                num_clients = len(self.client_queues)
-            
-            self.root.after(0, lambda n=num_clients: self.status_label.config(
-                text=f"🟢 Streaming to {n} client{'s' if n != 1 else ''}",
-                fg="#27ae60"))
-            
-            # Keep connection alive and send audio data from this client's queue
-            while self.is_streaming:
-                try:
-                    # Wait for audio data from the queue (blocking with timeout)
-                    data_bytes = client_queue.get(timeout=1.0)
-                    
-                    # Send audio data to this client
-                    client_conn.sendall(struct.pack(">I", len(data_bytes)) + data_bytes)
-                    
-                except Exception as e:
-                    if isinstance(e, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
-                        break
-                    # Queue.get timeout is normal, just continue
-                    if self.is_streaming and not isinstance(e, Exception) or str(e) != '':
-                        continue
-                    
-        except Exception as e:
-            if self.is_streaming:
-                self.root.after(0, lambda e=e, a=addr: self.log_message(
-                    f"❌ Client handler error for {a[0]}:{a[1]}: {str(e)}"))
-        finally:
-            # Remove client from dictionary
-            with self.clients_lock:
-                if client_conn in self.client_queues:
-                    del self.client_queues[client_conn]
-                num_clients = len(self.client_queues)
-            
-            try:
-                client_conn.close()
-            except:
-                pass
-            
-            self.root.after(0, lambda a=addr: self.log_message(f"⚠️ Client {a[0]}:{a[1]} disconnected"))
-            
-            if num_clients == 0:
-                self.root.after(0, lambda: self.status_label.config(
-                    text="🟡 Waiting for connections",
-                    fg="#f39c12"))
-            else:
-                self.root.after(0, lambda n=num_clients: self.status_label.config(
-                    text=f"🟢 Streaming to {n} client{'s' if n != 1 else ''}",
-                    fg="#27ae60"))
-    
-    def capture_audio(self):
-        """Continuously capture audio and broadcast to all connected clients."""
-        try:
-            default_speaker = sc.default_speaker()
-            self.mic = sc.get_microphone(id=str(default_speaker.name), include_loopback=True)
-            
-            with self.mic.recorder(samplerate=SAMPLE_RATE) as recorder:
-                while self.is_streaming:
-                    try:
-                        data = recorder.record(numframes=BLOCK_SIZE)
-                        data_bytes = data.astype(np.float32).tobytes()
-                        
-                        # Broadcast audio data to all connected clients
-                        with self.clients_lock:
-                            # Get a snapshot of current client queues
-                            queues_to_send = list(self.client_queues.items())
-                        
-                        # Send to each client's queue (outside the lock to avoid blocking)
-                        for client_conn, client_queue in queues_to_send:
-                            try:
-                                # Non-blocking put, drop packet if queue is full (client too slow)
-                                client_queue.put_nowait(data_bytes)
-                            except Full:
-                                # Queue full, client is lagging - skip this packet
-                                pass
-                            except Exception:
-                                # Client might have disconnected, ignore
-                                pass
-                            
-                    except Exception as e:
-                        if self.is_streaming:
-                            self.root.after(0, lambda e=e: self.log_message(f"⚠️ Audio capture error: {str(e)}"))
-                        break
-                        
-        except Exception as e:
-            self.root.after(0, lambda e=e: self.log_message(f"❌ Audio initialization error: {str(e)}"))
-    
-    def run_server(self, port):
-        try:
-            local_ip = self.get_local_ip()
-            self.log_message(f"🎧 Starting audio server...")
-            self.log_message(f"📡 Listening on {local_ip}:{port}")
-            
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind((HOST, port))
-            self.server_socket.listen(5)  # Allow up to 5 pending connections
-            self.server_socket.settimeout(1.0)  # Timeout for checking stop signal
-            
-            self.root.after(0, lambda: self.status_label.config(
-                text=f"🟡 Waiting for connections on {local_ip}:{port}",
-                fg="#f39c12"))
-            self.root.after(0, lambda: self.info_label.config(
-                text=f"Streaming on {local_ip}:{port}"))
-            
-            # Start audio capture thread
-            self.audio_thread = threading.Thread(target=self.capture_audio, daemon=True)
-            self.audio_thread.start()
-            
-            # Accept multiple client connections
-            while self.is_streaming:
-                try:
-                    client_conn, addr = self.server_socket.accept()
-                    
-                    # Start a new thread to handle this client
-                    client_thread = threading.Thread(
-                        target=self.handle_client, 
-                        args=(client_conn, addr), 
-                        daemon=True
-                    )
-                    client_thread.start()
-                    
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    if self.is_streaming:
-                        self.root.after(0, lambda e=e: self.log_message(f"❌ Accept error: {str(e)}"))
-                    break
-                    
-        except Exception as e:
-            self.root.after(0, lambda e=e: self.log_message(f"❌ Server error: {str(e)}"))
-        finally:
-            if self.server_socket:
-                self.server_socket.close()
-            self.root.after(0, self.cleanup_after_stop)
-    
-    def stop_server(self):
-        self.is_streaming = False
-        self.log_message("🛑 Stopping server...")
-        
-        # Close all client connections
-        with self.clients_lock:
-            for client_conn in list(self.client_queues.keys()):  # Make a copy of the keys
-                try:
-                    client_conn.close()
-                except:
-                    pass
-            self.client_queues.clear()
-        
-        if self.server_socket:
-            try:
-                self.server_socket.close()
-            except:
-                pass
-    
-    def cleanup_after_stop(self):
-        self.status_label.config(text="⚫ Stopped", fg="#e74c3c")
-        self.info_label.config(text="Click 'Start Server' to begin")
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
-        self.port_entry.config(state=tk.NORMAL)
-        
-    def on_closing(self):
-        if self.is_streaming:
-            self.stop_server()
-            time.sleep(0.5)
-        self.root.destroy()
+
 
 def main():
-    root = tk.Tk()
-    app = AudioServerGUI(root)
-    root.mainloop()
+    server = OptimizedAudioServer()
+    asyncio.run(server.start_server())
+
 
 if __name__ == "__main__":
     main()
