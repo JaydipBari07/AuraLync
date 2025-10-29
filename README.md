@@ -8,7 +8,7 @@ Stream audio from your PC to any device with a web browser. No app installation 
 
 ### Option 1: Use Executable (Easiest)
 
-1. Download `AuraLync.exe` from executables
+1. [⬇️ Download serverv2.0.exe](https://github.com/jaydipbari/AuraLync/blob/v2.0/executables/v2.0/serverv2.0.exe)
 2. Run the executable
 3. Scan the QR code with your phone
 4. Click "Connect" and "Start Playback"
